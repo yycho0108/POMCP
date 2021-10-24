@@ -2,10 +2,26 @@
 
 # import networkx as nx
 from graph_tool import Graph
+from graph_tool.util import find_vertex
 import numpy as np
 
 from dataclasses import dataclass
 from simple_parsing import Serializable
+
+#g = Graph()
+#v = g.add_vertex()
+#v2 = g.add_vertex()
+#print('vi(2)', g.vertex_index[ v2 ] )
+#e = g.add_edge(v,v2)
+#print(v)
+#print(v2)
+#g.remove_vertex(v)
+#print( g.vertex(0) )
+#print('vi', g.vertex_index[ g.vertex(0) ] )
+
+# How do I access v2 again??
+# print( g.vertex(1) ) # invalid
+# print(e.target())  # invalid
 
 #g = Graph()
 ##p = g.new_vertex_property('vector<int>')
@@ -44,8 +60,8 @@ class POMCP:
         gamma: float = 0.5
         c: float = 1.0  # UCB parameter
         threshold: float = 0.005  # discount threshold
-        max_iter: int = int(1e2)  # "number of runs from node"
-        num_particle: int = 1024  # number of particles??
+        max_iter: int = int(1e4)  # "number of runs from node"
+        num_particle: int = 1200  # number of particles??
         use_ucb: bool = True
 
         def __post_init__(self):
@@ -71,6 +87,8 @@ class POMCP:
         self._prop['value'] = self._tree.new_vertex_property('double')
         self._prop['N'] = self._tree.new_vertex_property('int')
         self._prop['is_action'] = self._tree.new_vertex_property('bool')
+        self._prop['is_root'] = self._tree.new_vertex_property(
+            'int', val=False)
 
         # self._prop['children'] =
         # self._tree.new_vertex_property('vector<int>')
@@ -87,21 +105,23 @@ class POMCP:
         # create a root node, i guess?
         # root = self._tree.add_vertex()
         # self._root = root
-        root = self._add_node(False)
+        root = self._add_node(False, is_root=True)
         self._root = root
 
     def _add_node(self, is_action: bool, value: float = 0.0,
-                  N: int = 0, belief=None, belief_index: int = 0):
+                  N: int = 0, belief=None, belief_index: int = 0,
+                  is_root: bool = False):
         v = self._tree.add_vertex()
 
         self._prop['value'][v] = value
         self._prop['N'][v] = N
         self._prop['is_action'][v] = is_action
+        self._prop['is_root'][v] = is_root
 
         if not is_action:
             self._prop['belief'][v] = []
             self._prop['belief_index'][v] = 0
-        print(F'added node {v} action={is_action}')
+        # print(F'added node {v} action={is_action}')
         return v
 
     def initialize(self, states, actions, observations):
@@ -109,24 +129,24 @@ class POMCP:
         self._actions = actions
         self._observations = observations
 
-    def search_best_action(self, node: int):
+    def search_best_action(
+            self, node: int, explore: bool = True, debug: bool = False):
         """Given the current node, try to give the best action.
 
         In some cases(?) returns None. What?
         """
 
-        if self._cfg.use_ucb:
-            # NOTE(ycho): Let's just accept either option.
-            if isinstance(node, int):
-                v = self._tree.vertex(node)
-            else:
-                v = node
-
+        # NOTE(ycho): Let's just accept either option.
+        if isinstance(node, int):
             v = self._tree.vertex(node)
+        else:
+            v = node
+
+        if explore:
             # NOTE(ycho): the below is the correct check::
-            if self._prop['is_action'][v]:
-                raise ValueError(
-                    'I guess we cannot get action after action node')
+            #if self._prop['is_action'][v]:
+            #    raise ValueError(
+            #        'I guess we cannot get action after action node')
 
             max_value = None
             result = None
@@ -136,28 +156,50 @@ class POMCP:
                 action = self._prop['action'][e]
                 child = e.target()
                 if self._prop['N'][child] == 0:
+                    if debug:
+                        print('exploring child with no visits!')
                     return (action, child)
 
                 # Compute utility via UCB
-                ucb = ucb(self._prop['N'][v], self._prop['N'][child],
-                          self._prop['value'][child],
-                          self._cfg.c)
+                value = ucb(self._prop['N'][v], self._prop['N'][child],
+                            self._prop['value'][child],
+                            self._cfg.c)
+
+                if debug:
+                    print(F'action value = {action}:{value}')
 
                 # argmax
-                if max_value is None or max_value < ucb:
-                    max_value = ucb
+                if max_value is None or max_value < value:
+                    max_value = value
                     result = child
                     result_a = action
             # somehow reached some node withuot any outgoing edges.
             #if max_value is None:
             #    raise ValueError('what?')
-
-            print(F'no action from {v}')
+            #    print(F'no action from {v}')
             n = self._prop['N'][v]
-            print(F'N[v] = {n}')
+            # print(F'N[v] = {n}')
             return result_a, result
         else:
-            return NotImplemented
+            # if self.tree.nodes[h][4] != -1:
+            #if self._prop['is_action'][v]:
+            #    raise ValueError(
+            #        'I guess we cannot get action after action node')
+
+            # children = self.tree.nodes[h][1]
+            max_value = None
+            result = None
+            result_a = None  # ?
+            for e in v.out_edges():
+                action = self._prop['action'][e]
+                child = e.target()
+                value = self._prop['value'][child]
+                if max_value is None or max_value < value:
+                    max_value = value
+                    result = child
+                    result_a = action
+
+            return result_a, result
 
     def rollout(self, state, node: int, depth: int):
         # or (self._cfg.gamma == 0)) and depth != 0):
@@ -190,7 +232,7 @@ class POMCP:
             # Add child node & connecting edge.
             for action in self._actions:
                 v = self._add_node(True)
-                print(F'added action from {source} -> {v}')
+                # print(F'added action from {source} -> {v}')
                 # v = self._tree.add_vertex()
                 e = self._tree.add_edge(source, v)
                 self._prop['action'][e] = action
@@ -205,12 +247,13 @@ class POMCP:
         # print('is action?', self._prop['is_action'][node])
         # print('node', node)
         a, next_node = self.search_best_action(node)
+        # print(a, next_node)
 
         s1, o, r = self._generate(state, a)
-        next_node = self.get_observation_node(next_node, o)
+        next_obs_node = self.get_observation_node(next_node, o)
         # print(F'got obs.node {next_node}')
         cum_reward = r + self._cfg.gamma * \
-            self.simulate(s1, next_node, depth + 1)
+            self.simulate(s1, next_obs_node, depth + 1)
 
         # "Backtrack" <<?
         # Wait, so `state` is a float/double??
@@ -221,8 +264,9 @@ class POMCP:
             i = self._prop['belief_index'][node]
             b[i] = state
 
+            # Increment index ...
             i2 = (i + 1) % self._cfg.num_particle
-            print(F'i = {i} -> {i2}')
+            # print(F'i = {i} -> {i2}')
             self._prop['belief_index'][node] = i2
         else:
             # Append!! :)
@@ -252,7 +296,7 @@ class POMCP:
         # NOTE(ycho): In case the nodes doesn't exist, create one.
         # v = self._tree.add_vertex()
         v = self._add_node(False)
-        print(F'added obs. node {v}')
+        # print(F'added obs. node {v}')
         e = self._tree.add_edge(vertex, v)
         # self._prop['is_action'][v] = False
         self._prop['action'][e] = sample
@@ -281,12 +325,12 @@ class POMCP:
             # might also work (and make it clearer, what we're doing.)
             self.simulate(s, node, 0)
         # action, _ = self.search_best_action(-1, use_ucb=True)
-        action, _ = self.search_best_action(node)
+        action, _ = self.search_best_action(node, explore=False, debug=True)
         return action
 
     def _posterior(self, belief, action, observation):
         if (belief is None) or len(belief) <= 0:
-            s = np.random.choice(self.states)
+            s = np.random.choice(self._states)
         else:
             s = np.random.choice(belief)
 
@@ -298,9 +342,31 @@ class POMCP:
         # result = self._posterior(belief, action, observation)
         # return result
 
+    def _prune(self, node, del_nodes, depth: int = 0):
+        # (1) accumulate `del_list`
+        del_nodes.append(node)
+        for e in node.out_edges():
+            # del_edges.append(e)
+            self._prune(e.target(), del_nodes, depth + 1)
+
+        # print(F'removing edges for node = [{node}]')
+        es = [e for e in node.out_edges()]
+        for e in es:
+            self._tree.remove_edge(e)
+        #for e in node.out_edges():
+        #   self._tree.remove_edge(e)
+
+        # Finalize pruning here.
+        if depth == 0:
+            # print('prune!')
+            # print('<remove_vertex>')
+            # self._tree.remove_edge(del_edges)
+            # print(del_nodes)
+            self._tree.remove_vertex(del_nodes)
+            # print('</remove_vertex>')
+
     def update(self, action, observation):
         """stateful update, current node & belief."""
-        # prior =
 
         # (1) find action node
         action_node = None
@@ -308,15 +374,40 @@ class POMCP:
             a = self._prop['action'][e]
             if (a == action):
                 action_node = e.target()
+                break
+        else:
+            raise ValueError('Target action node not found')
 
         # (2) find observation node
         # print('get_observation_node')
         obs_node = self.get_observation_node(action_node, observation)
 
-        # (3) update root
-        self._root = obs_node
+        # print(F'from = {self._root}')
+        # (3) TODO(ycho): prune
+        self._tree.remove_edge(
+            self._tree.edge(action_node, obs_node))  # root - action -/- obs
+        # node_id = int(obs_node)
+        node_id = self._tree.vertex_index[obs_node]
+        self._prop['is_root'][obs_node] = True
+        self._prune(self._root, [])
 
-        # (4) TODO(ycho): prune
+        # (4) update root
+        # obs_node = self._tree.vertex(node_id)
+        # FIXME(ycho): If you think about it, it's pretty "obvious"
+        # that the root node will correspond to index==0...
+        # this is, of course, the most robust way to do it...
+        self._root = None
+        if self._prop['is_root'][0]:
+            self._root = self._tree.vertex(0)
+        if self._root is None:
+            roots = find_vertex(self._tree, self._prop['is_root'], True)
+            # print(roots)
+            self._root = roots[0]
+
+        # obs_node =
+        # print('valid?', obs_node.is_valid())
+        # self._root = obs_node
+        # print(F'to   = {self._root}')
 
         # (5) update belief
         prior = np.copy(self._prop['belief'][self._root])
@@ -324,9 +415,11 @@ class POMCP:
         for _ in range(self._cfg.num_particle):
             posterior.append(self._posterior(prior, action, observation))
         self._prop['belief'][self._root] = posterior
+        print(np.mean(posterior), np.var(posterior))
 
 
 def get_problem():
+    # transition probs
     a = [9.000000000000000222e-01,
          4.000000000000000222e-01,
          3.499999999999999778e-01,
@@ -354,26 +447,69 @@ def get_problem():
     a = np.reshape(a, (2, 2, 2))
     b = np.reshape(b, (2, 2, 2))
     r = np.reshape(r, (2, 2))
+
+    # Make it less confusing
+    a = np.transpose(a, (1, 2, 0))
+    b = np.transpose(b, (1, 2, 0))
+
+    # A --> transition
+    # [[[0.9  0.1 ]
+    #   [0.4  0.6 ]]
+    #
+    #  [[0.35 0.65]
+    #   [0.8  0.2 ]]]
+
+    # a(0,0) --> (0.9, 0.1)
+    # a(0,1) --> (0.4, 0.6)
+    # a(1,0) --> (0.35, 0.65)
+    # a(1,1) --> (0.8, 0.2)
+    # ^^^ I guess this generally means lower probability of transitions
+    # being successful.
+
+    # B --> observation
+    # it's a function of
+    # (next_state, prev_action) ... why?
+    #[[[0.8 0.2]
+    #  [0.4 0.6]]
+    #
+    # [[0.3 0.7]
+    #  [0.5 0.5]]]
+
+    # b(0,0) --> (0.8, 0.2)
+    # b(0,1) --> (0.4, 0.6)
+    # b(1,0) --> (0.3, 0.7)
+    # b(1,1) --> (0.5, 0.5)
+    # I'm not sure why it's not just a function of
+    # the
+
     return a, b, r
 
 
 def main():
     import numpy as np
-    np.random.seed(0)
+    # np.random.seed(0)
 
     # from auxilliary import BuildTree, UCB
     from numpy.random import binomial, choice, multinomial
 
     # NOTE(ycho): No idea what this is
     a, b, r = get_problem()
+    print('a')
+    print(a)
+    print('b')
+    print(b)
+    print('r')
+    print(r)
 
     def _generate(s, act):
         # print('s', s)
         # print('act', act)
         # print('a', a)
-        ss = multinomial(1, a[:, s, act])
+        # print('prob', a[:,s,act])
+        ss = multinomial(1, a[s, act, :])
+        # print('ss', ss)
         ss = int(np.nonzero(ss)[0])
-        o = multinomial(1, b[:, ss, act])
+        o = multinomial(1, b[ss, act, :])
         o = int(np.nonzero(o)[0])
         # print('o', o)
         rw = r[s, act]
