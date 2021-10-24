@@ -8,47 +8,6 @@ import numpy as np
 from dataclasses import dataclass
 from simple_parsing import Serializable
 
-#g = Graph()
-#v = g.add_vertex()
-#v2 = g.add_vertex()
-#print('vi(2)', g.vertex_index[ v2 ] )
-#e = g.add_edge(v,v2)
-#print(v)
-#print(v2)
-#g.remove_vertex(v)
-#print( g.vertex(0) )
-#print('vi', g.vertex_index[ g.vertex(0) ] )
-
-# How do I access v2 again??
-# print( g.vertex(1) ) # invalid
-# print(e.target())  # invalid
-
-#g = Graph()
-##p = g.new_vertex_property('vector<int>')
-##v = g.add_vertex(1)
-##print(dir(p[v]))
-#p = g.new_vertex_property('int')
-#v = g.add_vertex(1)
-#p[v] += 1
-# print(p[v])
-# print(dir(p.set_value))
-# b = p[v] = 5
-# print(p[v])
-# print(dir(p[v]))
-
-# NOTE(ycho):
-# node properties::
-# h[0] = parent
-# h[1] = children; Dict[action, child_id]
-# h[2] = Nc (num children)
-# h[3] = value
-# h[4] = belief_distribution, -1 if action node
-
-#wtf = Graph(directed=True)
-#vp = wtf.new_vertex_property('vector<double>')
-#v = wtf.add_vertex()
-#print( dir(vp[v]) )
-
 
 def ucb(N: int, n: int, value: int, c: float = 1):
     return value + c * np.sqrt(np.log(N) / n)
@@ -62,7 +21,6 @@ class POMCP:
         threshold: float = 0.005  # discount threshold
         max_iter: int = int(1e4)  # "number of runs from node"
         num_particle: int = 1200  # number of particles??
-        use_ucb: bool = True
 
         def __post_init__(self):
             if self.gamma >= 1:
@@ -70,41 +28,27 @@ class POMCP:
 
     def __init__(self, cfg: Config, generate):
         self._cfg = cfg
-
-        def _generate(*args, **kwds):
-            # print(F'gen {args} {kwds}')
-            # print(F'gen {args}')
-            return generate(*args, **kwds)
-        self._generate = _generate
-
-        # NOTE(ycho): isn't directed `True`?
-        self._tree = Graph(directed=True)
-        self._prop = {}
+        self._generate = generate
+        self._tree = Graph(directed=True)  # tree
+        self._prop = {}  # propety map
         self._init_tree()
 
     def _init_tree(self):
-        # self._prop['parent'] = self._tree.new_vertex_property('int')
         self._prop['value'] = self._tree.new_vertex_property('double')
         self._prop['N'] = self._tree.new_vertex_property('int')
         self._prop['is_action'] = self._tree.new_vertex_property('bool')
         self._prop['is_root'] = self._tree.new_vertex_property(
             'int', val=False)
 
-        # self._prop['children'] =
-        # self._tree.new_vertex_property('vector<int>')
-        # self._prop['belief'] = self._tree.new_vertex_property('vector<double>')
-
         # NOTE(ycho): I gues the only reason that belief is a vector<int>
         # is because it's currently just a set of integer-valued states.
-        # It could probably be a much more complex thing, e.g. an actual
+        # It could/should probably be a much more complex thing, e.g. an actual
         # distribution.
         self._prop['belief'] = self._tree.new_vertex_property('vector<int>')
         self._prop['belief_index'] = self._tree.new_vertex_property('int')
         self._prop['action'] = self._tree.new_edge_property('int')
 
-        # create a root node, i guess?
-        # root = self._tree.add_vertex()
-        # self._root = root
+        # Create the root node.
         root = self._add_node(False, is_root=True)
         self._root = root
 
@@ -131,26 +75,27 @@ class POMCP:
 
     def search_best_action(
             self, node: int, explore: bool = True, debug: bool = False):
-        """Given the current node, try to give the best action.
-
-        In some cases(?) returns None. What?
-        """
+        """Given the current node, try to give the best action."""
 
         # NOTE(ycho): Let's just accept either option.
+        # TODO(ycho): consider `singledispatch`.
         if isinstance(node, int):
             v = self._tree.vertex(node)
         else:
             v = node
 
-        if explore:
-            # NOTE(ycho): the below is the correct check::
-            #if self._prop['is_action'][v]:
-            #    raise ValueError(
-            #        'I guess we cannot get action after action node')
+        # NOTE(ycho): In POMCP, observation<->action nodes alternate.
+        # This means we can't get an action node from an action node.
+        if self._prop['is_action'][v]:
+            raise ValueError(
+                'Cannot get action after action node!')
 
+        if explore:
+            # Use UCB / other acquisition function,
+            # instead of raw values.
             max_value = None
             result = None
-            result_a = None  # ?
+            result_a = None
 
             for e in v.out_edges():
                 action = self._prop['action'][e]
@@ -173,20 +118,11 @@ class POMCP:
                     max_value = value
                     result = child
                     result_a = action
-            # somehow reached some node withuot any outgoing edges.
-            #if max_value is None:
-            #    raise ValueError('what?')
-            #    print(F'no action from {v}')
-            n = self._prop['N'][v]
-            # print(F'N[v] = {n}')
+            if max_value is None:
+                raise ValueError(F'No outgoing action from {v}!!')
             return result_a, result
         else:
-            # if self.tree.nodes[h][4] != -1:
-            #if self._prop['is_action'][v]:
-            #    raise ValueError(
-            #        'I guess we cannot get action after action node')
-
-            # children = self.tree.nodes[h][1]
+            # TODO(ycho): unify this block with the above code.
             max_value = None
             result = None
             result_a = None  # ?
@@ -202,7 +138,6 @@ class POMCP:
             return result_a, result
 
     def rollout(self, state, node: int, depth: int):
-        # or (self._cfg.gamma == 0)) and depth != 0):
         if (self._cfg.gamma ** depth < self._cfg.threshold):
             return 0.0
 
@@ -214,8 +149,8 @@ class POMCP:
         s1, _, r = self._generate(state, a)
         return r + self._cfg.gamma * self.rollout(s1, None, depth + 1)
 
+    # @profile
     def simulate(self, state, node: int, depth: int) -> float:
-        # or (self._cfg.gamma == 0)) and depth != 0):
         if (self._cfg.gamma ** depth < self._cfg.threshold):
             return 0.0
 
@@ -305,12 +240,9 @@ class POMCP:
         return v
 
     def search(self):
-
-        # last_index = self._tree.num_vertices() - 1
-        # current_node = self._tree.vertex(last_index)
         node = self._root
 
-        # NOTE(ycho): why is this copied ??
+        # NOTE(ycho): why is this copied?
         belief = np.copy(self._prop['belief'][node])
 
         for _ in range(self._cfg.max_iter):
@@ -320,9 +252,6 @@ class POMCP:
                 s = np.random.choice(self._states)
             else:
                 s = np.random.choice(belief)  # Belief@node
-            # NOTE(ycho) why -1 instead of current_node??
-            # FIXME(ycho): I think replacing -1 with current_node
-            # might also work (and make it clearer, what we're doing.)
             self.simulate(s, node, 0)
         # action, _ = self.search_best_action(-1, use_ucb=True)
         action, _ = self.search_best_action(node, explore=False, debug=True)
@@ -343,27 +272,19 @@ class POMCP:
         # return result
 
     def _prune(self, node, del_nodes, depth: int = 0):
-        # (1) accumulate `del_list`
+        # Accumulate nodes to delete within the tree.
         del_nodes.append(node)
         for e in node.out_edges():
-            # del_edges.append(e)
             self._prune(e.target(), del_nodes, depth + 1)
 
-        # print(F'removing edges for node = [{node}]')
+        # NOTE(ycho): Cannot remove while iterating.
         es = [e for e in node.out_edges()]
         for e in es:
             self._tree.remove_edge(e)
-        #for e in node.out_edges():
-        #   self._tree.remove_edge(e)
 
-        # Finalize pruning here.
+        # Finalize pruning at the root level.
         if depth == 0:
-            # print('prune!')
-            # print('<remove_vertex>')
-            # self._tree.remove_edge(del_edges)
-            # print(del_nodes)
             self._tree.remove_vertex(del_nodes)
-            # print('</remove_vertex>')
 
     def update(self, action, observation):
         """stateful update, current node & belief."""
@@ -399,6 +320,7 @@ class POMCP:
         self._root = None
         if self._prop['is_root'][0]:
             self._root = self._tree.vertex(0)
+            # print('zero is root')
         if self._root is None:
             roots = find_vertex(self._tree, self._prop['is_root'], True)
             # print(roots)
