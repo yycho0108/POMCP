@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 
-# import networkx as nx
-from graph_tool import Graph
+from typing import List
+import logging
+import graph_tool
+from graph_tool import Graph, Vertex
 from graph_tool.util import find_vertex
 import numpy as np
 
@@ -18,9 +20,9 @@ class POMCP:
     class Config(Serializable):
         gamma: float = 0.5
         c: float = 1.0  # UCB parameter
-        threshold: float = 0.005  # discount threshold
-        max_iter: int = int(1e4)  # "number of runs from node"
-        num_particle: int = 1200  # number of particles??
+        threshold: float = 0.005  # Discount threshold
+        max_iter: int = int(2**13)  # Number of runs from node.
+        num_particle: int = 1024  # Number of particles.
 
         def __post_init__(self):
             if self.gamma >= 1:
@@ -37,8 +39,6 @@ class POMCP:
         self._prop['value'] = self._tree.new_vertex_property('double')
         self._prop['N'] = self._tree.new_vertex_property('int')
         self._prop['is_action'] = self._tree.new_vertex_property('bool')
-        self._prop['is_root'] = self._tree.new_vertex_property(
-            'int', val=False)
 
         # NOTE(ycho): I gues the only reason that belief is a vector<int>
         # is because it's currently just a set of integer-valued states.
@@ -49,23 +49,21 @@ class POMCP:
         self._prop['action'] = self._tree.new_edge_property('int')
 
         # Create the root node.
-        root = self._add_node(False, is_root=True)
+        root = self._add_node(False)
         self._root = root
 
     def _add_node(self, is_action: bool, value: float = 0.0,
-                  N: int = 0, belief=None, belief_index: int = 0,
-                  is_root: bool = False):
+                  N: int = 0, belief=None, belief_index: int = 0) -> Vertex:
         v = self._tree.add_vertex()
 
         self._prop['value'][v] = value
         self._prop['N'][v] = N
         self._prop['is_action'][v] = is_action
-        self._prop['is_root'][v] = is_root
 
         if not is_action:
             self._prop['belief'][v] = []
             self._prop['belief_index'][v] = 0
-        # print(F'added node {v} action={is_action}')
+        logging.debug(F'added node {v} action={is_action}')
         return v
 
     def initialize(self, states, actions, observations):
@@ -74,7 +72,7 @@ class POMCP:
         self._observations = observations
 
     def search_best_action(
-            self, node: int, explore: bool = True, debug: bool = False):
+            self, node: int, explore: bool = True):
         """Given the current node, try to give the best action."""
 
         # NOTE(ycho): Let's just accept either option.
@@ -101,17 +99,14 @@ class POMCP:
                 action = self._prop['action'][e]
                 child = e.target()
                 if self._prop['N'][child] == 0:
-                    if debug:
-                        print('exploring child with no visits!')
+                    logging.debug('exploring child with no visits!')
                     return (action, child)
 
                 # Compute utility via UCB
                 value = ucb(self._prop['N'][v], self._prop['N'][child],
                             self._prop['value'][child],
                             self._cfg.c)
-
-                if debug:
-                    print(F'action value = {action}:{value}')
+                logging.debug(F'action value = {action}:{value}')
 
                 # argmax
                 if max_value is None or max_value < value:
@@ -137,7 +132,7 @@ class POMCP:
 
             return result_a, result
 
-    def rollout(self, state, node: int, depth: int):
+    def rollout(self, state, node: int, depth: int) -> float:
         if (self._cfg.gamma ** depth < self._cfg.threshold):
             return 0.0
 
@@ -145,151 +140,142 @@ class POMCP:
         # FIXME(ycho): hardcoded uniform-random policy
         a = np.random.choice(self._actions)
 
-        # (2) s1,o,r = generate(s,a)
+        # (2) Generate next state from current action; repeat rollout.
         s1, _, r = self._generate(state, a)
         return r + self._cfg.gamma * self.rollout(s1, None, depth + 1)
 
-    # @profile
     def simulate(self, state, node: int, depth: int) -> float:
+        # Stop simulation when updates are no longer meaningful.
         if (self._cfg.gamma ** depth < self._cfg.threshold):
             return 0.0
 
         # NOTE(ycho): Let's just accept either option.
-        # print('node', node)  # // 0
         if isinstance(node, int):
             source = self._tree.vertex(node)
         else:
             source = node
 
         # Leaf Node?
-        # if source.out_degree == 0 or self._prop['N'][source] == 0:
         if self._prop['N'][source] == 0:
             # Add child node & connecting edge.
             for action in self._actions:
                 v = self._add_node(True)
-                # print(F'added action from {source} -> {v}')
-                # v = self._tree.add_vertex()
                 e = self._tree.add_edge(source, v)
                 self._prop['action'][e] = action
-                # self._prop['is_action'][v] = True
+                logging.debug(F'Added action from {source} -> {v}')
 
-            # Update source(==parent of new node)
+            # Update source(parent of new node)
             new_value = self.rollout(state, node, depth)
             self._prop['N'][source] += 1
             self._prop['value'][source] = new_value
             return new_value
 
-        # print('is action?', self._prop['is_action'][node])
-        # print('node', node)
-        a, next_node = self.search_best_action(node)
-        # print(a, next_node)
+        a, action_node = self.search_best_action(node)
 
         s1, o, r = self._generate(state, a)
-        next_obs_node = self.get_observation_node(next_node, o)
-        # print(F'got obs.node {next_node}')
+        obs_node = self.get_observation_node(action_node, o)
         cum_reward = r + self._cfg.gamma * \
-            self.simulate(s1, next_obs_node, depth + 1)
+            self.simulate(s1, obs_node, depth + 1)
 
-        # "Backtrack" <<?
-        # Wait, so `state` is a float/double??
+        # Update belief state.
         b = self._prop['belief'][node]
         if len(b) >= self._cfg.num_particle:
-            # Replace existing element (oldest first)
-            # print('reached max')
+            # Replace existing element (oldest first).
             i = self._prop['belief_index'][node]
             b[i] = state
 
-            # Increment index ...
+            # Increment index.
             i2 = (i + 1) % self._cfg.num_particle
-            # print(F'i = {i} -> {i2}')
             self._prop['belief_index'][node] = i2
         else:
-            # Append!! :)
+            # Append!
             b.append(state)
 
+        # Bookkeeping for the number of visits.
         self._prop['N'][node] += 1
-        self._prop['N'][next_node] += 1
+        self._prop['N'][action_node] += 1
 
-        # nodes num children increases ?
-        # TODO(ycho): is Nc number of visits?
-        # child-node's num children [ALSO] increases ?
+        # Update rule for value...
         dv = (cum_reward - self._prop['value']
-              [next_node]) / self._prop['N'][next_node]
-        self._prop['value'][next_node] += dv
+              [action_node]) / self._prop['N'][action_node]
+        self._prop['value'][action_node] += dv
+
         return cum_reward
 
-    def get_observation_node(self, node: int, sample):
+    def get_observation_node(self, node: int, observation) -> Vertex:
 
         # NOTE(ycho): Find corresponding observation node ...
         # FIXME(ycho): Is there an easier way to do this?
         vertex = self._tree.vertex(node)
         for e in vertex.out_edges():
             a = self._prop['action'][e]
-            if (a == sample):
+            if (a == observation):
                 return e.target()
 
         # NOTE(ycho): In case the nodes doesn't exist, create one.
         # v = self._tree.add_vertex()
         v = self._add_node(False)
-        # print(F'added obs. node {v}')
         e = self._tree.add_edge(vertex, v)
-        # self._prop['is_action'][v] = False
-        self._prop['action'][e] = sample
-        # NOTE(ycho): No need to repeat the search ...
-        # return self.get_observation_node(node, sample)
+        # TODO(ycho): rename `action` to something more like
+        # action_or_observation? :/
+        self._prop['action'][e] = observation
+        logging.debug(F'added obs. node {v}')
+
         return v
 
-    def search(self):
+    def search(self) -> int:
         node = self._root
 
-        # NOTE(ycho): why is this copied?
+        # NOTE(ycho): Why is this copied?
+        # TODO(ycho): Check if iteratively updating
+        # the belief distribution during the loop results
+        # in an invalid sampling procedure.
         belief = np.copy(self._prop['belief'][node])
 
         for _ in range(self._cfg.max_iter):
-            # TODO(ycho): Figure out why compare to []?
-            # if belief == []:
             if (belief is None) or len(belief) <= 0:
                 s = np.random.choice(self._states)
             else:
                 s = np.random.choice(belief)  # Belief@node
             self.simulate(s, node, 0)
-        # action, _ = self.search_best_action(-1, use_ucb=True)
-        action, _ = self.search_best_action(node, explore=False, debug=True)
+        action, _ = self.search_best_action(node, explore=False)
         return action
 
-    def _posterior(self, belief, action, observation):
+    def _sample_posterior(self, belief, action, observation):
+        # Sample previous state based on prior belief.
         if (belief is None) or len(belief) <= 0:
             s = np.random.choice(self._states)
         else:
             s = np.random.choice(belief)
 
-        #Sample from transition distribution
+        # Sample posterior state, based on transition distribution.
+        # FIXME(ycho): what if _generate(...) never
+        # retrieves the exact observation??
         while True:
             s_next, o_next, _ = self._generate(int(s), action)
             if o_next == observation:
                 return s_next
-        # result = self._posterior(belief, action, observation)
-        # return result
 
-    def _prune(self, node, del_nodes, depth: int = 0):
+    def _prune(self, node: Vertex, del_nodes: List[Vertex], depth: int = 0):
         # Accumulate nodes to delete within the tree.
         del_nodes.append(node)
         for e in node.out_edges():
             self._prune(e.target(), del_nodes, depth + 1)
 
-        # NOTE(ycho): Cannot remove while iterating.
+        # NOTE(ycho): Cannot remove edges while iterating,
+        # since the edge descriptors are invalidated.
         es = [e for e in node.out_edges()]
         for e in es:
             self._tree.remove_edge(e)
 
-        # Finalize pruning at the root level.
+        # Finalize pruning, if at the root level.
         if depth == 0:
             self._tree.remove_vertex(del_nodes)
 
     def update(self, action, observation):
         """stateful update, current node & belief."""
 
-        # (1) find action node
+        # (1) Find action node.
         action_node = None
         for e in self._root.out_edges():
             a = self._prop['action'][e]
@@ -299,45 +285,46 @@ class POMCP:
         else:
             raise ValueError('Target action node not found')
 
-        # (2) find observation node
-        # print('get_observation_node')
+        # (2) Find observation node.
         obs_node = self.get_observation_node(action_node, observation)
 
-        # print(F'from = {self._root}')
-        # (3) TODO(ycho): prune
+        # (3) Prune.
         self._tree.remove_edge(
             self._tree.edge(action_node, obs_node))  # root - action -/- obs
-        # node_id = int(obs_node)
-        node_id = self._tree.vertex_index[obs_node]
-        self._prop['is_root'][obs_node] = True
         self._prune(self._root, [])
 
-        # (4) update root
-        # obs_node = self._tree.vertex(node_id)
-        # FIXME(ycho): If you think about it, it's pretty "obvious"
-        # that the root node will correspond to index==0...
-        # this is, of course, the most robust way to do it...
+        # (4) Update the root node. (==obs_node)
+        # Since the previous vertex descriptor is invalidated,
+        # we need to find the corresponding vertex again.
+        # NOTE(ycho): If you think about it, it's pretty "obvious"
+        # that the root node will correspond to index==0.
+        # However, since this is not a "guaranteed" property,
+        # we also robustify the root-finding process with a boolean flag.
         self._root = None
-        if self._prop['is_root'][0]:
-            self._root = self._tree.vertex(0)
-            # print('zero is root')
+
+        # NOTE(ycho): Fast check based on the assumption that
+        # the root index will be generally 0.
+        root = self._tree.vertex(0)
+        if root.in_degree == 0:
+            self._root = root
+
+        # NOTE(ycho): Slow check based on the property
+        # that the root node does not have any parents.
         if self._root is None:
-            roots = find_vertex(self._tree, self._prop['is_root'], True)
-            # print(roots)
+            roots = find_vertex(self._tree, 'in', 0)
+            if len(roots) != 1:
+                raise ValueError('More than one root found!')
             self._root = roots[0]
 
-        # obs_node =
-        # print('valid?', obs_node.is_valid())
-        # self._root = obs_node
-        # print(F'to   = {self._root}')
-
-        # (5) update belief
-        prior = np.copy(self._prop['belief'][self._root])
+        # (5) Update belief.
+        prior = self._prop['belief'][self._root]
         posterior = []
         for _ in range(self._cfg.num_particle):
-            posterior.append(self._posterior(prior, action, observation))
+            posterior.append(
+                self._sample_posterior(
+                    prior, action, observation))
         self._prop['belief'][self._root] = posterior
-        print(np.mean(posterior), np.var(posterior))
+        logging.debug(np.mean(posterior), np.var(posterior))
 
 
 def get_problem():
@@ -424,18 +411,13 @@ def main():
     print(r)
 
     def _generate(s, act):
-        # print('s', s)
-        # print('act', act)
-        # print('a', a)
-        # print('prob', a[:,s,act])
         ss = multinomial(1, a[s, act, :])
-        # print('ss', ss)
         ss = int(np.nonzero(ss)[0])
         o = multinomial(1, b[ss, act, :])
         o = int(np.nonzero(o)[0])
-        # print('o', o)
         rw = r[s, act]
         return ss, o, rw
+
     agent = POMCP(POMCP.Config(), _generate)
     agent.initialize([0, 1], [0, 1], [0, 1])
 
@@ -444,9 +426,6 @@ def main():
         print('action = ', action)
         observation = np.random.choice([0, 1])
         agent.update(action, observation)
-        # (1) prune
-        # (2) update_belief(action,observation)
-        # break
 
 
 if __name__ == '__main__':
